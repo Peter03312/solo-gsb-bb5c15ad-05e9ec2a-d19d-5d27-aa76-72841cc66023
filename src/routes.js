@@ -13,7 +13,7 @@ const { parseRevisionItems, evaluateRevision } = require('./revision');
 const { parseWordRevisionItems, evaluateWordRevision } = require('./word-revision');
 const {
   normalizeLang, parseTranslationBody, parseConfirmBody, checkTranslationText,
-  syncTranslations, buildLangView, listLanguages, activeTranslationsByLang,
+  buildLangView, listLanguages, activeTranslationsByLang,
   evaluateExport, mapRow,
 } = require('./translation');
 const { parseDeliveryBody, evaluateDelivery, listBatches, loadBatch } = require('./delivery');
@@ -25,7 +25,7 @@ const {
 const speakerMod = require('./speaker');
 const {
   validateSpeakerName, listSpeakers, getSpeakerByNumber, createSpeaker, renameSpeaker,
-  syncAttributions, parseAttributionBatchBody, evaluateAttributionBatch, applyAttributionBatch,
+  parseAttributionBatchBody, evaluateAttributionBatch, applyAttributionBatch,
   buildAttributionView, parseAttributedExportBody, evaluateAttributedExport,
   insertAttributedExport, listAttributedExports, getAttributedExport,
 } = speakerMod;
@@ -39,9 +39,12 @@ const {
   SHAPE_STATES: RECOVERY_SHAPE_STATES, STALE_STATES: RECOVERY_STALE_STATES,
 } = require('./translation-recovery');
 const {
-  parseCommentBody, parseVersionBody, syncComments, buildCommentsView,
+  parseCommentBody, parseVersionBody, buildCommentsView,
   getComment, loadCommentView, intersectingSubtitles, snapshotOf,
 } = require('./comment');
+// 源字幕集写操作的统一级联对账：译文 / 说话人归属 / 复核意见与字幕写入、版本推进
+// 必须在同一事务内完成；任一对账写入或一致性断言失败 → ReconcileError，整批回滚。
+const { ReconcileError, reconcileCascade } = require('./reconcile');
 const {
   ReworkError, resolveBatch, findFile, loadFileCues, timelineOf, hitsInInterval,
   parseCreateBody: parseReworkCreateBody, parseVerdictBody: parseReworkVerdictBody,
@@ -146,6 +149,9 @@ function createApp(db) {
         cue_count: cueCount,
       });
     }
+    // 原子提交：词/切点/字幕写入 + 导入代次/字幕集版本推进 + 三类状态对账
+    // （译文与归属留历史、旧代次意见转历史）全部在同一事务内；任何写入或对账
+    // 断言失败都整批回滚，旧词/旧字幕/旧版本保持不变，可基于旧版本重试。
     const tx = db.transaction(() => {
       db.prepare('DELETE FROM subtitles WHERE project_id = ?').run(p.id);
       db.prepare('DELETE FROM words WHERE project_id = ?').run(p.id);
@@ -154,19 +160,27 @@ function createApp(db) {
       words.forEach((x, i) => ins.run(p.id, i, x.text.trim(), x.start_ms, x.end_ms));
       const insCut = db.prepare('INSERT INTO shots (project_id, idx, cut_ms) VALUES (?, ?, ?)');
       c.cuts.forEach((ms, i) => insCut.run(p.id, i, ms));
-      bumpSubVersion(db, p.id);
       // 逐词整体替换 → 新的导入代次：旧代次译文即使词区间/文本相同也无法确认导入归属，
       // 只留作历史、不可恢复。
       bumpImportVersion(db, p.id);
+      const newVersion = bumpSubVersion(db, p.id);
+      // 旧字幕行已全部删除：各语言译文全部留作历史（不按序号挪用到新排版的行）；
+      // 说话人归属同样留作历史（不按展示序号转移，新排版的行待标注）；
+      // 导入代次已推进：旧代次复核意见转历史（仅查看，不附到新词段、不可关闭）。
+      const cascade = reconcileCascade(db, p.id);
+      return { sub_version: newVersion, cascade };
     });
-    tx();
-    // 旧字幕行已全部删除：各语言译文全部留作历史（不按序号挪用到新排版的行）；
-    // 说话人归属同样留作历史（不按展示序号转移，新排版的行待标注）。
-    syncTranslations(db, p.id);
-    syncAttributions(db, p.id);
-    // 导入代次已推进：旧代次复核意见转历史（仅查看，不附到新词段、不可关闭）
-    syncComments(db, p.id);
-    res.json(loadProject(db, p.id));
+    let result;
+    try {
+      result = tx();
+    } catch (err) {
+      if (err instanceof ReconcileError) {
+        return res.status(500).json({ error: err.message, reasons: err.reasons, rolled_back: true });
+      }
+      throw err;
+    }
+    const fresh = loadProject(db, p.id);
+    res.json({ ...fresh, cascade: result.cascade });
   });
 
   // ---------- 规则（版本号拒绝过期提交） ----------
@@ -222,7 +236,7 @@ function createApp(db) {
       //   锁定行与内容完全一致的行 → 保留 ID/版本，只更新展示顺序 idx
       //     （仅锁定或展示顺序变化不使译文失效）；
       //   词区间相同但文本/时间变化的未锁定行 → 原地更新，行版本 +1
-      //     （事务提交后由 syncTranslations 把其译文转待复核）；
+      //     （同事务内 reconcileCascade 把其译文转待复核）；
       //   旧版中存在、候选整版已消失的未锁定行 → 删除（其译文留作历史）；
       //   候选整版中的新行 → INSERT 新 ID（视为缺译，绝不按序号挪用旧译文）。
       const lockedByKey = new Map(locked.map((s) => [`${s.word_start}:${s.word_end}`, s]));
@@ -264,21 +278,28 @@ function createApp(db) {
           ins.run(p.id, i, cue.word_start, cue.word_end, cue.text, cue.start_ms, cue.end_ms);
         }
       });
-      // 已消失的旧未锁定行：删除（其译文在 syncTranslations 中留作历史，不按序号挪用）
+      // 已消失的旧未锁定行：删除（其译文在对账中留作历史，不按序号挪用）
       const stale = p.subtitles.filter((s) => s.locked === 0 && !usedIds.has(s.id));
       const del = db.prepare('DELETE FROM subtitles WHERE id = ? AND project_id = ? AND locked = 0');
       stale.forEach((s) => del.run(s.id, p.id));
-      bumpSubVersion(db, p.id);
+      const newVersion = bumpSubVersion(db, p.id);
+      // 原子对账（与字幕写入、版本推进同事务）：源文本/时间/词区间变化的保留行译文
+      // 转待复核；删除行译文与归属留历史；已关闭意见的相交字幕快照漂移转待复核。
+      // 意见锚定词区间，不按字幕 ID 或行号迁移；纯锁定或排序变化不会被误判。
+      const cascade = reconcileCascade(db, p.id);
+      return { sub_version: newVersion, cascade };
     });
-    tx();
-    syncTranslations(db, p.id);
-    // 重排删除行的归属留作历史；保留 ID 的行（仅 idx 变化或原地更新）归属继续有效
-    syncAttributions(db, p.id);
-    // 重排拆并/字幕行更替后：已关闭意见的相交字幕快照若漂移则转待复核；
-    // 意见锚定词区间，不按字幕 ID 或行号迁移
-    syncComments(db, p.id);
+    let committed;
+    try {
+      committed = tx();
+    } catch (err) {
+      if (err instanceof ReconcileError) {
+        return res.status(500).json({ error: err.message, reasons: err.reasons, rolled_back: true });
+      }
+      throw err;
+    }
     const fresh = loadProject(db, p.id);
-    res.json({ sub_version: fresh.sub_version, subtitles: fresh.subtitles });
+    res.json({ sub_version: fresh.sub_version, subtitles: fresh.subtitles, cascade: committed.cascade });
   });
 
   // ---------- 单条字幕编辑 / 锁定（行级版本号） ----------
@@ -338,15 +359,28 @@ function createApp(db) {
         `UPDATE subtitles SET text = ?, start_ms = ?, end_ms = ?, locked = ?, version = version + 1
          WHERE id = ?`
       ).run(newText, newStart, newEnd, newLocked, sid);
-      bumpSubVersion(db, p.id);
+      const newVersion = bumpSubVersion(db, p.id);
+      // 原子对账（与字幕写入、版本推进同事务）：源字幕文本/时间变化 → 各语言该条译文
+      // 转待复核；已关闭意见的相交字幕快照漂移 → 待复核。仅锁定切换（内容一致）不失效。
+      // 行未删除，归属始终保留；纯锁定变化不会被误判。
+      const cascade = reconcileCascade(db, p.id);
+      return { sub_version: newVersion, cascade };
     });
-    tx();
-    // 源字幕文本/时间变化 → 各语言该条译文转待复核；仅锁定切换（内容一致）不失效
-    syncTranslations(db, p.id);
-    // 同理：已关闭意见的相交字幕快照漂移 → 待复核；仅锁定/展示顺序变化不触发
-    syncComments(db, p.id);
+    let committed;
+    try {
+      committed = tx();
+    } catch (err) {
+      if (err instanceof ReconcileError) {
+        return res.status(500).json({ error: err.message, reasons: err.reasons, rolled_back: true });
+      }
+      throw err;
+    }
     const fresh = loadProject(db, p.id);
-    res.json({ sub_version: fresh.sub_version, subtitle: fresh.subtitles.find((s) => s.id === sid) });
+    res.json({
+      sub_version: fresh.sub_version,
+      subtitle: fresh.subtitles.find((s) => s.id === sid),
+      cascade: committed.cascade,
+    });
   });
 
   // ---------- 导出（确认后生成不可变快照） ----------
@@ -992,19 +1026,18 @@ function createApp(db) {
         });
       }
       const subVersion = bumpSubVersion(db, fresh.id);
-      // 源字幕文本/时间变化 → 相关译文转待复核（同事务，与采纳原子一致）
-      syncTranslations(db, fresh.id);
-      // 已关闭复核意见的相交字幕快照漂移 → 待复核（同事务）
-      syncComments(db, fresh.id);
+      // 源字幕文本/时间变化 → 相关译文转待复核、已关闭意见快照漂移转待复核（同事务，
+      // 与采纳原子一致；对账或断言失败整组回滚）。行不删除，归属不变。
+      const cascade = reconcileCascade(db, fresh.id);
       db.prepare(
         `UPDATE revisions SET status = 'accepted', accepted_at = datetime('now'),
            accepted_sub_version = ? WHERE id = ?`
       ).run(subVersion, revision.id);
-      return subVersion;
+      return { subVersion, cascade };
     });
 
     try {
-      const subVersion = tx();
+      const committed = tx();
       const after = loadProject(db, p.id);
       const accepted = after.subtitles.filter((s) =>
         revision.items.some((it) => it.subtitle_id === s.id)
@@ -1012,13 +1045,17 @@ function createApp(db) {
       res.json({
         revision_id: revision.id,
         status: 'accepted',
-        sub_version: subVersion,
+        sub_version: committed.subVersion,
         applied: revision.items.length,
         subtitles: accepted,
+        cascade: committed.cascade,
       });
     } catch (err) {
       if (err instanceof AcceptReject) {
         return res.status(err.statusCode).json(err.payload);
+      }
+      if (err instanceof ReconcileError) {
+        return res.status(500).json({ error: err.message, reasons: err.reasons, rolled_back: true });
       }
       throw err;
     }
@@ -1278,17 +1315,15 @@ function createApp(db) {
       }
 
       const subVersion = bumpSubVersion(db, fresh.id);
-      // 词时间/受影响区间重排导致的源行变化：受影响行译文转待复核，被删行译文留历史；
-      // 被删行的说话人归属同样留作历史，新行待标注（不按展示序号转移）。
-      syncTranslations(db, fresh.id);
-      syncAttributions(db, fresh.id);
-      // 逐词改时/字幕行更替后：已关闭意见的相交字幕快照漂移 → 待复核
-      syncComments(db, fresh.id);
+      // 词时间/受影响区间重排导致的源行变化：受影响行译文转待复核，被删行译文与
+      // 说话人归属留历史（新行待标注，不按展示序号转移），已关闭意见快照漂移转待复核。
+      // 对账与断言同事务完成，任一失败 → 词、字幕与版本全部回滚。
+      const cascade = reconcileCascade(db, fresh.id);
       db.prepare(
         `UPDATE word_revisions SET status = 'confirmed', confirmed_at = datetime('now'),
            confirmed_sub_version = ? WHERE id = ?`
       ).run(subVersion, revision.id);
-      return { subVersion, replacedCount: replacedIds.length };
+      return { subVersion, replacedCount: replacedIds.length, cascade };
     });
 
     try {
@@ -1302,10 +1337,14 @@ function createApp(db) {
         cues_replaced: summary.replacedCount,
         words: after.words,
         subtitles: after.subtitles,
+        cascade: summary.cascade,
       });
     } catch (err) {
       if (err instanceof ConfirmReject) {
         return res.status(err.statusCode).json(err.payload);
+      }
+      if (err instanceof ReconcileError) {
+        return res.status(500).json({ error: err.message, reasons: err.reasons, rolled_back: true });
       }
       throw err;
     }

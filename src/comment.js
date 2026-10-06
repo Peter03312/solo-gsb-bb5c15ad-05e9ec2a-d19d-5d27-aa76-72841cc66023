@@ -114,12 +114,33 @@ function snapshotEquals(a, b) {
   return true;
 }
 
+/** 快照 JSON 损坏错误：对账无法判定状态，外层事务必须整体回滚 */
+class SnapshotCorruptError extends Error {
+  constructor(commentId, cause) {
+    super(`复核意见 ${commentId} 的关闭快照已损坏，无法对账`);
+    this.name = 'SnapshotCorruptError';
+    this.commentId = commentId;
+    this.cause = cause;
+  }
+}
+
+/** 解析关闭快照；JSON 损坏抛出 SnapshotCorruptError（由外层捕获并整事务回滚） */
+function parseSnapshot(row) {
+  if (!row.snapshot_json) return null;
+  try {
+    return JSON.parse(row.snapshot_json);
+  } catch (err) {
+    throw new SnapshotCorruptError(row.id, err);
+  }
+}
+
 /**
  * 字幕集变更后的统一对账（与 syncTranslations 相同的调用时机）：
  *   1) 重新导入后旧代次意见 → history（仅作历史查看，不附到新词段、不可关闭/重开）；
  *   2) closed 意见：相交当前字幕的 文本/时间/词区间 相对关闭快照漂移 → review；
  *      仅锁定或展示顺序变化不处理；
  *   3) open / review / history 保持原状：review 只能由校对者再次显式关闭消解。
+ * 关闭快照 JSON 损坏时抛 SnapshotCorruptError（不应静默放过，由事务边界整体回滚）。
  * 返回 { history, review } 本次受影响数量。
  */
 function syncComments(db, projectId) {
@@ -145,8 +166,8 @@ function syncComments(db, projectId) {
         WHERE id = ? AND status = 'closed'`
     );
     for (const row of closedRows) {
+      const snap = parseSnapshot(row);
       const current = snapshotOf(intersectingSubtitles(subtitles, row.word_start, row.word_end));
-      const snap = row.snapshot_json ? JSON.parse(row.snapshot_json) : null;
       if (!snapshotEquals(snap, current)) {
         upd.run(row.id);
         reviewed++;
