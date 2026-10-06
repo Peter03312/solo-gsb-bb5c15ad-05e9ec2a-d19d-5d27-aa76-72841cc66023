@@ -146,6 +146,9 @@ function createApp(db) {
         cue_count: cueCount,
       });
     }
+    // 一次原子提交：词/切点写入、字幕清空、版本推进与译文/归属/意见对账全部在
+    // 同一事务内完成；任一步失败整次回滚（含 sub_version 与 import_version），
+    // 调用方可基于旧版本重试，不会留下半提交。
     const tx = db.transaction(() => {
       db.prepare('DELETE FROM subtitles WHERE project_id = ?').run(p.id);
       db.prepare('DELETE FROM words WHERE project_id = ?').run(p.id);
@@ -158,14 +161,15 @@ function createApp(db) {
       // 逐词整体替换 → 新的导入代次：旧代次译文即使词区间/文本相同也无法确认导入归属，
       // 只留作历史、不可恢复。
       bumpImportVersion(db, p.id);
+      // 同事务对账（提交后立即查询即得一致结果）：
+      // 旧字幕行已全部删除 → 各语言译文全部留作历史（不按序号挪用到新排版的行）；
+      // 说话人归属同样留作历史（不按展示序号转移，新排版的行待标注）；
+      // 导入代次已推进 → 旧代次复核意见转历史（仅查看，不附到新词段、不可关闭）。
+      syncTranslations(db, p.id);
+      syncAttributions(db, p.id);
+      syncComments(db, p.id);
     });
     tx();
-    // 旧字幕行已全部删除：各语言译文全部留作历史（不按序号挪用到新排版的行）；
-    // 说话人归属同样留作历史（不按展示序号转移，新排版的行待标注）。
-    syncTranslations(db, p.id);
-    syncAttributions(db, p.id);
-    // 导入代次已推进：旧代次复核意见转历史（仅查看，不附到新词段、不可关闭）
-    syncComments(db, p.id);
     res.json(loadProject(db, p.id));
   });
 
@@ -217,12 +221,14 @@ function createApp(db) {
         conflicts: result.conflicts,
       });
     }
+    // 一次原子提交：字幕写入、sub_version 推进与译文/归属/意见对账全部在同一
+    // 事务内完成；任一步失败整次回滚（含 sub_version），调用方可基于旧版本重试。
     const tx = db.transaction(() => {
       // 身份保持：以词区间为身份。
       //   锁定行与内容完全一致的行 → 保留 ID/版本，只更新展示顺序 idx
       //     （仅锁定或展示顺序变化不使译文失效）；
       //   词区间相同但文本/时间变化的未锁定行 → 原地更新，行版本 +1
-      //     （事务提交后由 syncTranslations 把其译文转待复核）；
+      //     （同事务内由 syncTranslations 把其译文转待复核）；
       //   旧版中存在、候选整版已消失的未锁定行 → 删除（其译文留作历史）；
       //   候选整版中的新行 → INSERT 新 ID（视为缺译，绝不按序号挪用旧译文）。
       const lockedByKey = new Map(locked.map((s) => [`${s.word_start}:${s.word_end}`, s]));
@@ -269,14 +275,15 @@ function createApp(db) {
       const del = db.prepare('DELETE FROM subtitles WHERE id = ? AND project_id = ? AND locked = 0');
       stale.forEach((s) => del.run(s.id, p.id));
       bumpSubVersion(db, p.id);
+      // 同事务对账（提交后立即查询即得一致结果）：
+      // 文本/时间变化的行译文转待复核，被删行译文留作历史；
+      // 被删行的归属留作历史，保留 ID 的行（仅 idx 变化或原地更新）归属继续有效；
+      // 已关闭意见的相交字幕快照若漂移则转待复核（意见锚定词区间，不按字幕 ID/行号迁移）。
+      syncTranslations(db, p.id);
+      syncAttributions(db, p.id);
+      syncComments(db, p.id);
     });
     tx();
-    syncTranslations(db, p.id);
-    // 重排删除行的归属留作历史；保留 ID 的行（仅 idx 变化或原地更新）归属继续有效
-    syncAttributions(db, p.id);
-    // 重排拆并/字幕行更替后：已关闭意见的相交字幕快照若漂移则转待复核；
-    // 意见锚定词区间，不按字幕 ID 或行号迁移
-    syncComments(db, p.id);
     const fresh = loadProject(db, p.id);
     res.json({ sub_version: fresh.sub_version, subtitles: fresh.subtitles });
   });
@@ -333,18 +340,21 @@ function createApp(db) {
       }
     }
 
+    // 一次原子提交：字幕写入、行版本与 sub_version 推进、译文/意见对账全部在
+    // 同一事务内完成；任一步失败整次回滚（含版本），调用方可基于旧版本重试。
     const tx = db.transaction(() => {
       db.prepare(
         `UPDATE subtitles SET text = ?, start_ms = ?, end_ms = ?, locked = ?, version = version + 1
          WHERE id = ?`
       ).run(newText, newStart, newEnd, newLocked, sid);
       bumpSubVersion(db, p.id);
+      // 同事务对账（提交后立即查询即得一致结果）：
+      // 源字幕文本/时间变化 → 各语言该条译文转待复核；仅锁定切换（内容一致）不失效；
+      // 已关闭意见的相交字幕快照漂移 → 待复核；仅锁定/展示顺序变化不触发。
+      syncTranslations(db, p.id);
+      syncComments(db, p.id);
     });
     tx();
-    // 源字幕文本/时间变化 → 各语言该条译文转待复核；仅锁定切换（内容一致）不失效
-    syncTranslations(db, p.id);
-    // 同理：已关闭意见的相交字幕快照漂移 → 待复核；仅锁定/展示顺序变化不触发
-    syncComments(db, p.id);
     const fresh = loadProject(db, p.id);
     res.json({ sub_version: fresh.sub_version, subtitle: fresh.subtitles.find((s) => s.id === sid) });
   });

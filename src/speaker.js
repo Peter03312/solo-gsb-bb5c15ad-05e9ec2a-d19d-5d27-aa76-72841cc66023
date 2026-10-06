@@ -112,7 +112,8 @@ function renameSpeaker(db, projectId, speakerId, displayName) {
 }
 
 /**
- * 源字幕行删除后的归属对账：active 归属若锚定的字幕行已不存在
+ * 源字幕行删除后的归属对账（与源变更写入、版本推进在同一事务内调用，
+ * 合并为一次原子提交）：active 归属若锚定的字幕行已不存在
  * （重排删除、词修正确认删除、重新导入），转 history 并置空 subtitle_id；
  * 保留 ID 的行（含仅顺序变化、原地更新）归属继续有效；绝不按展示序号转移。
  * 返回转历史的条数。
